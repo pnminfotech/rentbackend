@@ -194,6 +194,18 @@ function normalizeBusinessPhone(value) {
   return /^[6-9]\d{9}$/.test(phone) ? phone : "";
 }
 
+function hasDeveloperOtpResendBypass(phone) {
+  if (String(process.env.NODE_ENV || "").toLowerCase() === "production") return false;
+  const allowedPhone = normalizeBusinessPhone(process.env.DEV_OTP_RESEND_BYPASS_PHONE);
+  return Boolean(allowedPhone && normalizeBusinessPhone(phone) === allowedPhone);
+}
+
+function phoneLoginResendAvailableAt(phone, now) {
+  return hasDeveloperOtpResendBypass(phone)
+    ? now
+    : new Date(now.getTime() + 5 * 60 * 1000);
+}
+
 function businessPhoneVariants(phone) {
   return [phone, `+91${phone}`, `91${phone}`, `0${phone}`];
 }
@@ -372,7 +384,7 @@ async function sendPhoneLoginCode(phone, challengeId) {
     phone,
     codeHash: hashPhoneLoginCode(id, code),
     codeExpiresAt: new Date(now.getTime() + 5 * 60 * 1000),
-    resendAvailableAt: new Date(now.getTime() + 5 * 60 * 1000),
+    resendAvailableAt: phoneLoginResendAvailableAt(phone, now),
     expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000),
   });
   return { challenge, code };
@@ -884,7 +896,7 @@ router.post("/auth/login/request-phone-code", phoneLoginRequestIpLimit, phoneLog
     }).sort({ createdAt: -1 });
     if (activeChallenge) {
       const resendAvailableAt = activeChallenge.resendAvailableAt || activeChallenge.codeExpiresAt || activeChallenge.expiresAt;
-      if (resendAvailableAt > now) {
+      if (!hasDeveloperOtpResendBypass(phone) && resendAvailableAt > now) {
         const retryAfterSeconds = Math.ceil((resendAvailableAt.getTime() - now.getTime()) / 1000);
         res.setHeader("Retry-After", String(retryAfterSeconds));
         return res.status(429).json({
@@ -923,6 +935,7 @@ router.post("/auth/login/request-phone-code", phoneLoginRequestIpLimit, phoneLog
       phone: maskedPhone(phone),
       expiresInMinutes: 5,
       resendAvailableAt: challenge.resendAvailableAt,
+      ...(delivery.devCode ? { devCode: delivery.devCode } : {}),
     });
   } catch (error) {
     console.error("phone login request error:", error?.message || error);
@@ -931,6 +944,7 @@ router.post("/auth/login/request-phone-code", phoneLoginRequestIpLimit, phoneLog
 });
 
 router.post("/auth/login/verify-phone-code", phoneLoginVerifyIpLimit, phoneLoginVerifyChallengeLimit, async (req, res) => {
+  let verifiedPhone = "";
   try {
     const challengeId = String(req.body?.challengeId || "").trim();
     const code = String(req.body?.code || "").trim();
@@ -992,6 +1006,7 @@ router.post("/auth/login/verify-phone-code", phoneLoginVerifyIpLimit, phoneLogin
       { new: true }
     );
     if (!consumed) return res.status(400).json({ message: "Sign-in request expired. Please start again." });
+    verifiedPhone = normalizeBusinessPhone(consumed.phone);
 
     const tenantMatches = await findTenantPhoneMatches(consumed.phone);
     if (tenantMatches.length) {
@@ -1036,7 +1051,36 @@ router.post("/auth/login/verify-phone-code", phoneLoginVerifyIpLimit, phoneLogin
       return res.status(409).json({ message: error.message });
     }
     if (error?.code === 11000) {
-      return res.status(409).json({ message: "This mobile number already has an account. Please request a fresh OTP." });
+      console.error("phone login duplicate-key conflict:", error.keyPattern || "unknown unique index");
+      // A concurrent OTP verification may have created this account after the
+      // initial lookup. Reuse that account instead of making the user restart.
+      if (verifiedPhone) {
+        const [phoneMatches, phoneIdentityMatch] = await Promise.all([
+          findUsersByPhone(verifiedPhone),
+          SystemUser.findOne({ email: `phone-${verifiedPhone}@phone-login.invalid` }),
+        ]);
+        const candidates = [...phoneMatches, ...(phoneIdentityMatch ? [phoneIdentityMatch] : [])];
+        const internalPhoneAccount = candidates.find((candidate) =>
+          candidate.role === "system_admin" &&
+          String(candidate.email || "").toLowerCase() === `phone-${verifiedPhone}@phone-login.invalid`
+        );
+        const existingUsers = [...new Map(candidates
+          .filter((candidate) => candidate.role === "system_admin" && (
+            normalizeBusinessPhone(candidate.phone) === verifiedPhone || candidate._id === internalPhoneAccount?._id
+          ))
+          .map((candidate) => [String(candidate._id), candidate])).values()];
+        if (existingUsers.length === 1 && existingUsers[0].status !== "suspended") {
+          const user = existingUsers[0];
+          const organization = user.organizationId ? await Organization.findById(user.organizationId) : null;
+          if (organization) {
+            user.lastLoginAt = new Date();
+            if (String(req.get("X-Platform") || "web").toLowerCase() !== "mobile") user.lastWebActivityAt = new Date();
+            await user.save();
+            return res.json({ token: signSystemToken(user, req.get("X-Platform")), user: publicUser(user), organization });
+          }
+        }
+      }
+      return res.status(409).json({ message: "Your OTP was verified, but account setup found an existing record that needs support. Requesting another OTP will not fix this; please contact support with your mobile number." });
     }
     console.error("phone login verification error:", error?.message || error);
     return res.status(500).json({ message: "Unable to verify the OTP. Please try again." });
@@ -1058,7 +1102,7 @@ router.post("/auth/login/resend-phone-code", phoneLoginResendIpLimit, phoneLogin
     if (!challenge) return res.status(400).json({ message: "Sign-in request expired. Start again." });
     const now = new Date();
     const resendAvailableAt = challenge.resendAvailableAt || challenge.codeExpiresAt || challenge.expiresAt;
-    if (resendAvailableAt > now) {
+    if (!hasDeveloperOtpResendBypass(challenge.phone) && resendAvailableAt > now) {
       const retryAfterSeconds = Math.ceil((resendAvailableAt.getTime() - now.getTime()) / 1000);
       res.setHeader("Retry-After", String(retryAfterSeconds));
       return res.status(429).json({
@@ -1070,7 +1114,7 @@ router.post("/auth/login/resend-phone-code", phoneLoginResendIpLimit, phoneLogin
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
     challenge.codeHash = hashPhoneLoginCode(challenge._id, code);
     challenge.codeExpiresAt = new Date(now.getTime() + 5 * 60 * 1000);
-    challenge.resendAvailableAt = new Date(now.getTime() + 5 * 60 * 1000);
+    challenge.resendAvailableAt = phoneLoginResendAvailableAt(challenge.phone, now);
     challenge.attempts = 0;
     challenge.resendCount += 1;
     await challenge.save();
@@ -1092,6 +1136,7 @@ router.post("/auth/login/resend-phone-code", phoneLoginResendIpLimit, phoneLogin
       phone: maskedPhone(challenge.phone),
       expiresInMinutes: 5,
       resendAvailableAt: challenge.resendAvailableAt,
+      ...(delivery.devCode ? { devCode: delivery.devCode } : {}),
     });
   } catch (error) {
     console.error("phone login resend error:", error?.message || error);

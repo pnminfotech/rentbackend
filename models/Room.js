@@ -35,6 +35,7 @@ const RoomSchema = new mongoose.Schema(
     lastMeterReading: { type: Number, default: null },
     beds: { type: [BedSchema], default: [] },
     isPlaceholder: { type: Boolean, default: false, index: true },
+    planGenerated: { type: Boolean, default: false, index: true },
   },
   { timestamps: true, optimisticConcurrency: true }
 );

@@ -165,6 +165,13 @@ async function sendTenantLoginOtp({ tenant = {}, code }) {
 }
 
 async function sendBusinessLoginOtp({ to, code }) {
+  if (
+    process.env.NODE_ENV !== "production" &&
+    String(process.env.DEV_SHOW_LOGIN_OTP_ON_SCREEN || "").toLowerCase() === "true"
+  ) {
+    return { sent: true, provider: "development-screen", devCode: String(code) };
+  }
+
   const message = `Your ${process.env.SMS_BRAND_NAME || "EazyRent"} sign-in code is ${code}. It expires in 5 minutes. Do not share this code.`;
   return sendSms({
     to,

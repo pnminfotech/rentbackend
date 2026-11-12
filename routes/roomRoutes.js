@@ -237,9 +237,193 @@ function normalizePropertyLocations(value) {
   }).filter(Boolean);
 }
 
+function plannedCountForLocation(location, wingName, floorNo) {
+  const desiredWing = normalizeText(wingName || "No Wing").toLowerCase();
+  const desiredFloor = normalizeText(floorNo).toLowerCase();
+  const entry = Object.entries(location?.floorUnitCounts || {}).find(([key]) => {
+    const [wing, ...floorParts] = String(key).split("::");
+    return normalizeText(wing || "No Wing").toLowerCase() === desiredWing &&
+      normalizeText(floorParts.join("::")).toLowerCase() === desiredFloor;
+  });
+  return Math.max(0, Math.floor(Number(entry?.[1]) || 0));
+}
+
+function plannedFloorKey(propertyType, category, wingName, floorNo) {
+  return [propertyType, normalizeText(category).toLowerCase(), normalizeText(wingName || "No Wing").toLowerCase(), normalizeText(floorNo).toLowerCase()].join("::");
+}
+
+async function performPlannedUnitRowsSync(req, propertyLocations) {
+  const quota = req.organizationId ? await getUnitQuota(req.organizationId) : null;
+
+  const allUnits = await Room.find(scopedQuery(req, {}));
+  const readyUnits = allUnits.filter((unit) => !unit.isPlaceholder);
+  const placeholdersByType = new Map(["bed", "room", "shop"].map((type) => [type, allUnits.filter((unit) => unit.isPlaceholder && normalizePropertyType(unit.propertyType) === type)]));
+  const readyCounts = { beds: 0, rooms: 0, shops: 0 };
+  for (const unit of readyUnits) {
+    if (unit.propertyType === "bed") readyCounts.beds += unit.beds?.length || 0;
+    else if (unit.propertyType === "room") readyCounts.rooms += 1;
+    else if (unit.propertyType === "shop") readyCounts.shops += 1;
+  }
+
+  const targets = [];
+  for (const location of propertyLocations) {
+    const propertyType = normalizePropertyType(location.propertyType);
+    const floors = (location.wings || []).length
+      ? location.wings.flatMap((wing) => (wing.floors || []).map((floorNo) => ({ wingName: wing.name, floorNo })))
+      : (location.floors || []).map((floorNo) => ({ wingName: "", floorNo }));
+    for (const { wingName, floorNo } of floors) {
+      const plannedCount = plannedCountForLocation(location, wingName, floorNo);
+      const readyCount = readyUnits.reduce((sum, unit) => {
+        if (normalizePropertyType(unit.propertyType) !== propertyType ||
+          normalizeText(unit.category).toLowerCase() !== normalizeText(location.name).toLowerCase() ||
+          normalizeText(unit.wingName).toLowerCase() !== normalizeText(wingName).toLowerCase() ||
+          normalizeText(unit.floorNo).toLowerCase() !== normalizeText(floorNo).toLowerCase()) return sum;
+        return sum + (propertyType === "bed" ? unit.beds?.length || 0 : 1);
+      }, 0);
+      targets.push({
+        propertyType,
+        category: location.name,
+        wingName,
+        floorNo,
+        key: plannedFloorKey(propertyType, location.name, wingName, floorNo),
+        count: Math.max(0, plannedCount - readyCount),
+      });
+    }
+  }
+
+  const requestedByType = {
+    beds: readyCounts.beds + targets.filter((target) => target.propertyType === "bed").reduce((sum, target) => sum + target.count, 0),
+    rooms: readyCounts.rooms + targets.filter((target) => target.propertyType === "room").reduce((sum, target) => sum + target.count, 0),
+    shops: readyCounts.shops + targets.filter((target) => target.propertyType === "shop").reduce((sum, target) => sum + target.count, 0),
+  };
+  if (quota?.introductory) {
+    const totalRequested = requestedByType.beds + requestedByType.rooms + requestedByType.shops;
+    if (totalRequested > quota.introductoryLimit) {
+      const error = new Error(`Planned units exceed the ${quota.introductoryLimit}-unit trial capacity.`);
+      error.status = 400;
+      throw error;
+    }
+  } else if (quota) {
+    for (const [key, requested] of Object.entries(requestedByType)) {
+      if (requested > Number(quota.limits?.[key] || 0)) {
+        const label = key === "beds" ? "beds" : key;
+        const error = new Error(`Planned ${label} exceed the allocated capacity of ${quota.limits?.[key] || 0}. Increase your unit count before saving this floor plan.`);
+        error.status = 400;
+        throw error;
+      }
+    }
+  }
+
+  const assigned = new Set();
+  const assignedTargetById = new Map();
+  const assignments = [];
+  for (const target of targets) {
+    if (!target.count) continue;
+    const pool = placeholdersByType.get(target.propertyType) || [];
+    const alreadyOnFloor = pool.filter((unit) => !assigned.has(String(unit._id)) && unit.planGenerated &&
+      plannedFloorKey(unit.propertyType, unit.category, unit.wingName, unit.floorNo) === target.key);
+    const available = [
+      ...alreadyOnFloor,
+      ...pool.filter((unit) => !assigned.has(String(unit._id)) && !alreadyOnFloor.includes(unit)),
+    ];
+    const chosen = available.slice(0, target.count);
+    for (const unit of chosen) {
+      assigned.add(String(unit._id));
+      assignedTargetById.set(String(unit._id), target);
+    }
+    assignments.push({ target, units: chosen, missing: target.count - chosen.length });
+  }
+
+  const typeKeys = { bed: "beds", room: "rooms", shop: "shops" };
+  for (const type of ["bed", "room", "shop"]) {
+    const pool = placeholdersByType.get(type) || [];
+    const missing = assignments.filter((entry) => entry.target.propertyType === type).reduce((sum, entry) => sum + entry.missing, 0);
+    if (!missing) continue;
+    if (quota?.readOnly) {
+      const error = new Error("Your subscription has ended. Purchase a plan before adding planned unit rows.");
+      error.status = 403;
+      throw error;
+    }
+    const key = typeKeys[type];
+    const existingCapacity = pool.reduce((sum, unit) => sum + placeholderCapacity(unit), 0);
+    const readyCapacity = readyCounts[key];
+    const limit = quota?.introductory ? quota.introductoryLimit : Number(quota?.limits?.[key] || 0);
+    const availableCapacity = quota ? Math.max(0, limit - readyCapacity - existingCapacity) : missing;
+    if (missing > availableCapacity) {
+      const error = new Error(`There is not enough available ${key} capacity to create the planned rows.`);
+      error.status = 400;
+      throw error;
+    }
+    let serial = Date.now();
+    const newRows = [];
+    for (const entry of assignments.filter((item) => item.target.propertyType === type && item.missing > 0)) {
+      for (let index = 0; index < entry.missing; index += 1) {
+        serial += 1;
+        const bedNo = `PENDING-${serial}`;
+        const roomNo = `UNASSIGNED-${type.toUpperCase()}-PLAN-${serial}`;
+        newRows.push({ entry, payload: scopedCreate(req, {
+          propertyType: type,
+          category: entry.target.category,
+          hasWing: Boolean(entry.target.wingName),
+          wingName: entry.target.wingName || "",
+          floorNo: entry.target.floorNo,
+          flatType: "",
+          roomNo,
+          meterNo: "",
+          lastMeterReading: null,
+          beds: [{ bedNo, bedCategory: type === "bed" ? "Unassigned" : type === "shop" ? "Shop" : "Rental Room", price: null }],
+          isPlaceholder: true,
+          planGenerated: true,
+        }) });
+      }
+    }
+    if (newRows.length) {
+      const inserted = await Room.insertMany(newRows.map((row) => row.payload));
+      inserted.forEach((placeholder, index) => {
+        const target = newRows[index].entry.target;
+        newRows[index].entry.units.push(placeholder);
+        assigned.add(String(placeholder._id));
+        assignedTargetById.set(String(placeholder._id), target);
+      });
+    }
+  }
+
+  for (const type of ["bed", "room", "shop"]) {
+    const pool = placeholdersByType.get(type) || [];
+    const operations = [];
+    for (const unit of pool) {
+      const target = assignedTargetById.get(String(unit._id));
+      const fields = target
+        ? { category: target.category, hasWing: Boolean(target.wingName), wingName: target.wingName || "", floorNo: target.floorNo, flatType: "", isPlaceholder: true, planGenerated: true }
+        : unit.planGenerated
+          ? { category: "Unassigned", hasWing: false, wingName: "", floorNo: "Unassigned", flatType: type === "room" ? "Unassigned" : "", planGenerated: false }
+          : null;
+      if (fields) operations.push({ updateOne: { filter: scopedQuery(req, { _id: unit._id }), update: { $set: scopedUpdate(req, fields) } } });
+    }
+    if (operations.length) await Room.bulkWrite(operations, { ordered: true });
+  }
+}
+
+const plannedUnitSyncLocks = new Map();
+function syncPlannedUnitRows(req, propertyLocations) {
+  const key = String(req.organizationId || req.admin?._id || "legacy-admin");
+  const previous = plannedUnitSyncLocks.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(() => performPlannedUnitRowsSync(req, propertyLocations));
+  plannedUnitSyncLocks.set(key, current);
+  return current.finally(() => {
+    if (plannedUnitSyncLocks.get(key) === current) plannedUnitSyncLocks.delete(key);
+  });
+}
+
 router.get("/property-locations", async (req, res) => {
   try {
-    res.json(req.organization?.propertyLocations || req.admin?.propertyLocations || []);
+    const propertyLocations = req.organization?.propertyLocations || req.admin?.propertyLocations || [];
+    try {
+      await syncPlannedUnitRows(req, propertyLocations);
+    } catch (syncError) {
+      console.warn("Unable to synchronize planned unit rows:", syncError.message);
+    }
+    res.json(propertyLocations);
   } catch (err) {
     res.status(500).json({ message: "Unable to load properties." });
   }
@@ -249,6 +433,7 @@ router.put("/property-locations", async (req, res) => {
   try {
     const propertyLocations = normalizePropertyLocations(req.body?.propertyLocations);
     if (!propertyLocations) return res.status(400).json({ message: "Property list is invalid." });
+    await syncPlannedUnitRows(req, propertyLocations);
     if (req.organization) {
       req.organization.propertyLocations = propertyLocations;
       await req.organization.save();
@@ -260,7 +445,7 @@ router.put("/property-locations", async (req, res) => {
     }
     res.json({ propertyLocations });
   } catch (err) {
-    res.status(500).json({ message: "Unable to save properties." });
+    res.status(err.status || 500).json({ message: err.message || "Unable to save properties." });
   }
 });
 
@@ -572,6 +757,7 @@ router.post("/", async (req, res) => {
       meterNo,
       lastMeterReading,
       bedCount,
+      bedNumbers,
       bedNo,
       bedCategory,
       price,
@@ -603,16 +789,24 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Invalid meter reading" });
     }
 
-    const normalizedBedCount =
-      normalizedPropertyType === "bed" && bedCount !== undefined
-        ? Number(bedCount)
-        : 0;
+    const normalizedBedNumbers = Array.isArray(bedNumbers)
+      ? bedNumbers.map((number) => normalizeIdentifier(number))
+      : null;
+    const normalizedBedCount = normalizedPropertyType === "bed"
+      ? (normalizedBedNumbers ? normalizedBedNumbers.length : bedCount !== undefined ? Number(bedCount) : 0)
+      : 0;
     if (
       normalizedPropertyType === "bed" &&
-      bedCount !== undefined &&
+      (bedCount !== undefined || normalizedBedNumbers) &&
       (!Number.isInteger(normalizedBedCount) || normalizedBedCount < 1)
     ) {
       return res.status(400).json({ message: "bedCount must be a positive integer" });
+    }
+    if (normalizedBedNumbers && (
+      normalizedBedNumbers.some((number) => !number) ||
+      new Set(normalizedBedNumbers.map((number) => number.toLowerCase())).size !== normalizedBedNumbers.length
+    )) {
+      return res.status(400).json({ message: "Bed numbers must be present and unique" });
     }
 
     if (normalizedHasWing && !normalizedWingName) {
@@ -655,7 +849,7 @@ router.post("/", async (req, res) => {
     const beds =
       normalizedPropertyType === "bed"
         ? Array.from({ length: normalizedBedCount }, (_, index) => ({
-            bedNo: normalizedBedCount === 1 && String(bedNo || "").trim() ? normalizeIdentifier(bedNo) : `B${index + 1}`,
+            bedNo: normalizedBedNumbers?.[index] || (normalizedBedCount === 1 && String(bedNo || "").trim() ? normalizeIdentifier(bedNo) : `B${index + 1}`),
             bedCategory: normalizeText(bedCategory || "Standard") || "Standard",
             price: normalizedPrice,
           }))
@@ -693,6 +887,7 @@ router.post("/", async (req, res) => {
       primaryPlaceholder.lastMeterReading = normalizedLastMeterReading;
       primaryPlaceholder.beds = beds;
       primaryPlaceholder.isPlaceholder = false;
+      primaryPlaceholder.planGenerated = false;
       await primaryPlaceholder.save();
 
       if (normalizedPropertyType === "bed" && neededCapacity > 1) {
@@ -1196,6 +1391,7 @@ router.put("/:roomId", async (req, res) => {
       !normalizeIdentifier(nextLocation.roomNo).startsWith("UNASSIGNED-");
     if (completesPlaceholder) {
       update.isPlaceholder = false;
+      update.planGenerated = false;
     }
 
     const duplicateUnit = await Room.findOne(scopedQuery(req, {
