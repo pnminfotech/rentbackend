@@ -231,7 +231,7 @@ function normalizePropertyLocations(value) {
     })).filter((wing) => wing.name);
     const floorUnitCounts = Object.fromEntries(Object.entries(item?.floorUnitCounts && typeof item.floorUnitCounts === "object" ? item.floorUnitCounts : {})
       .slice(0, 500)
-      .map(([key, count]) => [normalizeText(key).slice(0, 140), Math.max(0, Math.min(5000, Math.floor(Number(count) || 0)))])
+      .map(([key, count]) => [normalizeText(key).slice(0, 140), Math.max(0, Math.floor(Number(count) || 0))])
       .filter(([key]) => key));
     return { propertyType, name, wings, floors: normalizeList(item?.floors), floorUnitCounts };
   }).filter(Boolean);
@@ -258,13 +258,6 @@ async function performPlannedUnitRowsSync(req, propertyLocations) {
   const allUnits = await Room.find(scopedQuery(req, {}));
   const readyUnits = allUnits.filter((unit) => !unit.isPlaceholder);
   const placeholdersByType = new Map(["bed", "room", "shop"].map((type) => [type, allUnits.filter((unit) => unit.isPlaceholder && normalizePropertyType(unit.propertyType) === type)]));
-  const readyCounts = { beds: 0, rooms: 0, shops: 0 };
-  for (const unit of readyUnits) {
-    if (unit.propertyType === "bed") readyCounts.beds += unit.beds?.length || 0;
-    else if (unit.propertyType === "room") readyCounts.rooms += 1;
-    else if (unit.propertyType === "shop") readyCounts.shops += 1;
-  }
-
   const targets = [];
   for (const location of propertyLocations) {
     const propertyType = normalizePropertyType(location.propertyType);
@@ -291,29 +284,6 @@ async function performPlannedUnitRowsSync(req, propertyLocations) {
     }
   }
 
-  const requestedByType = {
-    beds: readyCounts.beds + targets.filter((target) => target.propertyType === "bed").reduce((sum, target) => sum + target.count, 0),
-    rooms: readyCounts.rooms + targets.filter((target) => target.propertyType === "room").reduce((sum, target) => sum + target.count, 0),
-    shops: readyCounts.shops + targets.filter((target) => target.propertyType === "shop").reduce((sum, target) => sum + target.count, 0),
-  };
-  if (quota?.introductory) {
-    const totalRequested = requestedByType.beds + requestedByType.rooms + requestedByType.shops;
-    if (totalRequested > quota.introductoryLimit) {
-      const error = new Error(`Planned units exceed the ${quota.introductoryLimit}-unit trial capacity.`);
-      error.status = 400;
-      throw error;
-    }
-  } else if (quota) {
-    for (const [key, requested] of Object.entries(requestedByType)) {
-      if (requested > Number(quota.limits?.[key] || 0)) {
-        const label = key === "beds" ? "beds" : key;
-        const error = new Error(`Planned ${label} exceed the allocated capacity of ${quota.limits?.[key] || 0}. Increase your unit count before saving this floor plan.`);
-        error.status = 400;
-        throw error;
-      }
-    }
-  }
-
   const assigned = new Set();
   const assignedTargetById = new Map();
   const assignments = [];
@@ -334,7 +304,6 @@ async function performPlannedUnitRowsSync(req, propertyLocations) {
     assignments.push({ target, units: chosen, missing: target.count - chosen.length });
   }
 
-  const typeKeys = { bed: "beds", room: "rooms", shop: "shops" };
   for (const type of ["bed", "room", "shop"]) {
     const pool = placeholdersByType.get(type) || [];
     const missing = assignments.filter((entry) => entry.target.propertyType === type).reduce((sum, entry) => sum + entry.missing, 0);
@@ -342,16 +311,6 @@ async function performPlannedUnitRowsSync(req, propertyLocations) {
     if (quota?.readOnly) {
       const error = new Error("Your subscription has ended. Purchase a plan before adding planned unit rows.");
       error.status = 403;
-      throw error;
-    }
-    const key = typeKeys[type];
-    const existingCapacity = pool.reduce((sum, unit) => sum + placeholderCapacity(unit), 0);
-    const readyCapacity = readyCounts[key];
-    const limit = quota?.introductory ? quota.introductoryLimit : Number(quota?.limits?.[key] || 0);
-    const availableCapacity = quota ? Math.max(0, limit - readyCapacity - existingCapacity) : missing;
-    if (missing > availableCapacity) {
-      const error = new Error(`There is not enough available ${key} capacity to create the planned rows.`);
-      error.status = 400;
       throw error;
     }
     let serial = Date.now();
@@ -758,6 +717,7 @@ router.post("/", async (req, res) => {
       lastMeterReading,
       bedCount,
       bedNumbers,
+      bedCategories,
       bedNo,
       bedCategory,
       price,
@@ -791,6 +751,9 @@ router.post("/", async (req, res) => {
 
     const normalizedBedNumbers = Array.isArray(bedNumbers)
       ? bedNumbers.map((number) => normalizeIdentifier(number))
+      : null;
+    const normalizedBedCategories = Array.isArray(bedCategories)
+      ? bedCategories.map((category) => normalizeText(category))
       : null;
     const normalizedBedCount = normalizedPropertyType === "bed"
       ? (normalizedBedNumbers ? normalizedBedNumbers.length : bedCount !== undefined ? Number(bedCount) : 0)
@@ -850,7 +813,7 @@ router.post("/", async (req, res) => {
       normalizedPropertyType === "bed"
         ? Array.from({ length: normalizedBedCount }, (_, index) => ({
             bedNo: normalizedBedNumbers?.[index] || (normalizedBedCount === 1 && String(bedNo || "").trim() ? normalizeIdentifier(bedNo) : `B${index + 1}`),
-            bedCategory: normalizeText(bedCategory || "Standard") || "Standard",
+            bedCategory: normalizedBedCategories?.[index] || normalizeText(bedCategory || "Standard") || "Standard",
             price: normalizedPrice,
           }))
         : [

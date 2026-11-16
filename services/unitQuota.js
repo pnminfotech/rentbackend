@@ -146,6 +146,10 @@ async function getUnitQuota(organizationId) {
   );
   if (organization.onboardingMode !== "flexible" && !readOnly) await ensureReservedUnits(organizationId, limits);
   const usage = await getUnitUsage(organizationId);
+  // Flexible accounts on the free default trial do not have a per-type unit
+  // cap. Paid plans continue to use their purchased allocations below.
+  const unlimited = organization.onboardingMode === "flexible" &&
+    !subscription.planId && Number(subscription.amount || 0) === 0;
   const introductory = organization.onboardingMode === "flexible" && !organization.unitCountsConfigured && !subscription.planId && Number(subscription.amount || 0) === 0;
   const remaining = {
     beds: Math.max(0, limits.beds - usage.beds),
@@ -158,6 +162,7 @@ async function getUnitQuota(organizationId) {
     usage,
     remaining,
     readOnly,
+    unlimited,
     subscriptionId: subscription._id,
     introductory,
     introductoryLimit: introductory ? INTRODUCTORY_UNIT_LIMIT : null,
@@ -187,6 +192,8 @@ async function assertUnitCapacity(organizationId, requested = {}) {
       throw err;
     }
   }
+
+  if (quota.unlimited) return quota;
 
   if (quota.introductory) {
     if (totalUnits(quota.usage) + totalUnits(increments) > INTRODUCTORY_UNIT_LIMIT) {
