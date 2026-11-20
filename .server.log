@@ -1,4 +1,4 @@
-✅ Server running: ttps://rentmobile-api.pnminfotech.com
+✅ Server running: http://localhost:8000
 ✅ Health:      http://localhost:8000/api/health
 DB Connected
 Checked and archived expired leave records.
